@@ -214,6 +214,7 @@ class ProtoBuf(val context: SerialContext? = null) {
         val curId
             get() = curTag.first
         private var curTag: Pair<Int, Int> = -1 to -1
+        private var remainingSz = 0
 
         init {
             readTag()
@@ -251,18 +252,48 @@ class ProtoBuf(val context: SerialContext? = null) {
         }
 
         fun nextInt(format: ProtoNumberType): Int {
-            val wireType = if (format == ProtoNumberType.FIXED) i32 else VARINT
-            if (wireType != curTag.second) throw ProtobufDecodingException("Unexpected wire type: ${curTag.second}")
-            val ans = decode32(format)
-            readTag()
+            val ans: Int
+            if (curTag.second == SIZE_DELIMITED) {
+                // repeated packed ints
+                if (remainingSz == 0) {
+                    remainingSz = decode32()
+                    check(remainingSz > 0)
+                }
+                val availableBefore = inp.available()
+                ans = decode32(format)
+                remainingSz -= (availableBefore - inp.available())
+                if (remainingSz == 0) {
+                    readTag()
+                }
+            } else {
+                val wireType = if (format == ProtoNumberType.FIXED) i32 else VARINT
+                if (wireType != curTag.second) throw ProtobufDecodingException("Unexpected wire type: ${curTag.second}")
+                ans = decode32(format)
+                readTag()
+            }
             return ans
         }
 
         fun nextLong(format: ProtoNumberType): Long {
-            val wireType = if (format == ProtoNumberType.FIXED) i64 else VARINT
-            if (wireType != curTag.second) throw ProtobufDecodingException("Unexpected wire type: ${curTag.second}")
-            val ans = decode64(format)
-            readTag()
+            val ans: Long
+            if (curTag.second == SIZE_DELIMITED) {
+                // repeated packed longs
+                if (remainingSz == 0) {
+                    remainingSz = decode32()
+                    check(remainingSz > 0)
+                }
+                val availableBefore = inp.available()
+                ans = decode64(format)
+                remainingSz -= (availableBefore - inp.available())
+                if (remainingSz == 0) {
+                    readTag()
+                }
+            } else {
+                val wireType = if (format == ProtoNumberType.FIXED) i64 else VARINT
+                if (wireType != curTag.second) throw ProtobufDecodingException("Unexpected wire type: ${curTag.second}")
+                ans = decode64(format)
+                readTag()
+            }
             return ans
         }
 
