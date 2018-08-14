@@ -22,7 +22,9 @@ import kotlinx.serialization.internal.*
 import kotlinx.serialization.protobuf.ProtoBuf.Varint.decodeSignedVarintInt
 import kotlinx.serialization.protobuf.ProtoBuf.Varint.decodeSignedVarintLong
 import kotlinx.serialization.protobuf.ProtoBuf.Varint.decodeVarint
+import kotlinx.serialization.protobuf.ProtoBuf.Varint.decodeVarlong
 import kotlinx.serialization.protobuf.ProtoBuf.Varint.encodeVarint
+import kotlin.math.min
 import kotlin.reflect.KClass
 
 enum class ProtoNumberType {
@@ -147,7 +149,7 @@ class ProtoBuf(val context: SerialContext? = null) {
                 }
     }
 
-    private open inner class ProtobufReader(val decoder: ProtobufDecoder) : TaggedInput<ProtoDesc>() {
+    internal open inner class ProtobufReader(val decoder: ProtobufDecoder) : TaggedInput<ProtoDesc>() {
 
         init {
             context = this@ProtoBuf.context
@@ -187,18 +189,25 @@ class ProtoBuf(val context: SerialContext? = null) {
 
         override fun readElement(desc: KSerialClassDesc): Int {
             while (true) {
-                if (decoder.curId == -1) // EOF
+                if (decoder.curId == -1) {// EOF
+                    decoder.endObject()
                     return READ_DONE
-                val ind = indexByTag.getOrPut(decoder.curId, { findIndexByTag(desc, decoder.curId) })
-                if (ind == -1) // not found
+                }
+                val ind = indexByTag.getOrPut(decoder.curId) { findIndexByTag(desc, decoder.curId) }
+                if (ind == -1) {// not found
                     decoder.skipElement()
+                }
                 else return ind
             }
         }
     }
 
-    private inner class RepeatedReader(decoder: ProtobufDecoder, val targetTag: ProtoDesc) : ProtobufReader(decoder) {
+    internal inner class RepeatedReader(decoder: ProtobufDecoder, val targetTag: ProtoDesc) : ProtobufReader(decoder) {
         private var ind = 0
+        internal var remainingSize = 0
+
+        override fun readTaggedInt(tag: ProtoDesc): Int = decoder.nextRepeatedInt(this, tag.second)
+        override fun readTaggedLong(tag: ProtoDesc): Long = decoder.nextRepeatedLong(this, tag.second)
 
         override fun readElement(desc: KSerialClassDesc) = if (decoder.curId == targetTag.first) ++ind else READ_DONE
         override fun KSerialClassDesc.getTag(index: Int): ProtoDesc = targetTag
@@ -210,11 +219,10 @@ class ProtoBuf(val context: SerialContext? = null) {
                 else 2 to (parentTag?.second ?: ProtoNumberType.DEFAULT)
     }
 
-    internal class ProtobufDecoder(val inp: ByteArrayInputStream) {
+    internal class ProtobufDecoder(val inp: LimitedByteArrayInputStream) {
         val curId
             get() = curTag.first
         private var curTag: Pair<Int, Int> = -1 to -1
-        private var remainingSz = 0
 
         init {
             readTag()
@@ -236,65 +244,75 @@ class ProtoBuf(val context: SerialContext? = null) {
             when(curTag.second) {
                 VARINT -> nextInt(ProtoNumberType.DEFAULT)
                 i64 -> nextLong(ProtoNumberType.FIXED)
-                SIZE_DELIMITED -> nextObject()
+                SIZE_DELIMITED -> skipObject()
                 i32 -> nextInt(ProtoNumberType.FIXED)
             }
             readTag()
         }
 
-        fun nextObject(): ByteArray {
-            if (curTag.second != SIZE_DELIMITED) throw ProtobufDecodingException("Unexpected wire type: ${curTag.second}")
-            val len = decode32()
-            check(len >= 0)
-            val ans = inp.readExactNBytes(len)
+        private fun skipObject() {
+            inp.skip(nextLength().toLong())
+        }
+
+        fun beginObject(): Int {
+            val len = nextLength()
+            inp.pushLimit(len)
+            readTag()
+            return len
+        }
+
+        fun endObject() {
+            inp.skipAllAvailableBytes()
+            inp.popLimit()
+            readTag()
+        }
+
+        fun nextInt(format: ProtoNumberType): Int {
+            val wireType = if (format == ProtoNumberType.FIXED) i32 else VARINT
+            if (wireType != curTag.second) throw ProtobufDecodingException("Unexpected wire type: ${curTag.second}")
+            val ans = decode32(format)
             readTag()
             return ans
         }
 
-        fun nextInt(format: ProtoNumberType): Int {
-            val ans: Int
-            if (curTag.second == SIZE_DELIMITED) {
-                // repeated packed ints
-                if (remainingSz == 0) {
-                    remainingSz = decode32()
-                    check(remainingSz > 0)
-                }
-                val availableBefore = inp.available()
-                ans = decode32(format)
-                remainingSz -= (availableBefore - inp.available())
-                if (remainingSz == 0) {
-                    readTag()
-                }
-            } else {
-                val wireType = if (format == ProtoNumberType.FIXED) i32 else VARINT
-                if (wireType != curTag.second) throw ProtobufDecodingException("Unexpected wire type: ${curTag.second}")
-                ans = decode32(format)
-                readTag()
-            }
+        fun nextLong(format: ProtoNumberType): Long {
+            val wireType = if (format == ProtoNumberType.FIXED) i64 else VARINT
+            if (wireType != curTag.second) throw ProtobufDecodingException("Unexpected wire type: ${curTag.second}")
+            val ans = decode64(format)
+            readTag()
             return ans
         }
 
-        fun nextLong(format: ProtoNumberType): Long {
-            val ans: Long
-            if (curTag.second == SIZE_DELIMITED) {
-                // repeated packed longs
-                if (remainingSz == 0) {
-                    remainingSz = decode32()
-                    check(remainingSz > 0)
+        fun nextRepeatedInt(reader: RepeatedReader, format: ProtoNumberType): Int = when {
+            curTag.second != SIZE_DELIMITED -> nextInt(format)
+            else -> {
+                if (reader.remainingSize == 0) {
+                    reader.remainingSize = nextLength()
                 }
                 val availableBefore = inp.available()
-                ans = decode64(format)
-                remainingSz -= (availableBefore - inp.available())
-                if (remainingSz == 0) {
+                val ans = decode32(format)
+                reader.remainingSize -= (availableBefore - inp.available())
+                if (reader.remainingSize == 0) {
                     readTag()
                 }
-            } else {
-                val wireType = if (format == ProtoNumberType.FIXED) i64 else VARINT
-                if (wireType != curTag.second) throw ProtobufDecodingException("Unexpected wire type: ${curTag.second}")
-                ans = decode64(format)
-                readTag()
+                ans
             }
-            return ans
+        }
+
+        fun nextRepeatedLong(reader: RepeatedReader, format: ProtoNumberType): Long = when {
+            curTag.second != SIZE_DELIMITED -> nextLong(format)
+            else -> {
+                if (reader.remainingSize == 0) {
+                    reader.remainingSize = nextLength()
+                }
+                val availableBefore = inp.available()
+                val ans = decode64(format)
+                reader.remainingSize -= (availableBefore - inp.available())
+                if (reader.remainingSize == 0) {
+                    readTag()
+                }
+                ans
+            }
         }
 
         fun nextFloat(): Float {
@@ -312,18 +330,27 @@ class ProtoBuf(val context: SerialContext? = null) {
         }
 
         fun nextString(): String {
-            val bytes = this.nextObject()
-            return stringFromUtf8Bytes(bytes)
+            val bytes = inp.readExactNBytes(nextLength())
+            val str = stringFromUtf8Bytes(bytes)
+            readTag()
+            return str
+        }
+
+        private fun nextLength(): Int {
+            if (curTag.second != SIZE_DELIMITED) throw ProtobufDecodingException("Unexpected wire type: ${curTag.second}")
+            val len = decode32()
+            check(len >= 0)
+            return len
         }
 
         private fun decode32(format: ProtoNumberType = ProtoNumberType.DEFAULT, eofAllowed: Boolean = false): Int = when (format) {
-            ProtoNumberType.DEFAULT -> decodeVarint(inp, 64, eofAllowed).toInt()
+            ProtoNumberType.DEFAULT -> decodeVarint(inp, eofAllowed)
             ProtoNumberType.SIGNED -> decodeSignedVarintInt(inp)
             ProtoNumberType.FIXED -> inp.readToByteBuffer(4).order(ByteOrder.LITTLE_ENDIAN).getInt()
         }
 
         private fun decode64(format: ProtoNumberType = ProtoNumberType.DEFAULT): Long = when (format) {
-            ProtoNumberType.DEFAULT -> decodeVarint(inp, 64)
+            ProtoNumberType.DEFAULT -> decodeVarlong(inp)
             ProtoNumberType.SIGNED -> decodeSignedVarintLong(inp)
             ProtoNumberType.FIXED -> inp.readToByteBuffer(8).order(ByteOrder.LITTLE_ENDIAN).getLong()
         }
@@ -368,12 +395,33 @@ class ProtoBuf(val context: SerialContext? = null) {
             return out
         }
 
-        internal fun decodeVarint(inp: InputStream, bitLimit: Int = 32, eofOnStartAllowed: Boolean = false): Long {
+        internal fun decodeVarint(inp: LimitedByteArrayInputStream, eofOnStartAllowed: Boolean = false): Int {
+            var result = 0
+            var shift = 0
+            var b: Int
+            do {
+                if (shift >= 32) {
+                    // Out of range
+                    throw ProtobufDecodingException("Varint too long")
+                }
+                // Get 7 bits from next byte
+                b = inp.read()
+                if (b == -1) {
+                    if (eofOnStartAllowed && shift == 0) return -1
+                    else throw IOException("Unexpected EOF")
+                }
+                result = result or (b and 0x7F shl shift)
+                shift += 7
+            } while (b and 0x80 != 0)
+            return result
+        }
+
+        internal fun decodeVarlong(inp: LimitedByteArrayInputStream, eofOnStartAllowed: Boolean = false): Long {
             var result = 0L
             var shift = 0
             var b: Int
             do {
-                if (shift >= bitLimit) {
+                if (shift >= 64) {
                     // Out of range
                     throw ProtobufDecodingException("Varint too long")
                 }
@@ -389,8 +437,8 @@ class ProtoBuf(val context: SerialContext? = null) {
             return result
         }
 
-        internal fun decodeSignedVarintInt(inp: InputStream): Int {
-            val raw = decodeVarint(inp, 32).toInt()
+        internal fun decodeSignedVarintInt(inp: LimitedByteArrayInputStream): Int {
+            val raw = decodeVarint(inp)
             val temp = raw shl 31 shr 31 xor raw shr 1
             // This extra step lets us deal with the largest signed values by treating
             // negative results from read unsigned methods as like unsigned values.
@@ -398,23 +446,22 @@ class ProtoBuf(val context: SerialContext? = null) {
             return temp xor (raw and (1 shl 31))
         }
 
-        internal fun decodeSignedVarintLong(inp: InputStream): Long {
-            val raw = decodeVarint(inp, 64)
+        internal fun decodeSignedVarintLong(inp: LimitedByteArrayInputStream): Long {
+            val raw = decodeVarlong(inp)
             val temp = raw shl 63 shr 63 xor raw shr 1
             // This extra step lets us deal with the largest signed values by treating
             // negative results from read unsigned methods as like unsigned values
             // Must re-flip the top bit if the original read value had it set.
             return temp xor (raw and (1L shl 63))
-
         }
     }
 
     companion object {
-        // todo: make more memory-efficient
         private fun makeDelimited(decoder: ProtobufDecoder, parentTag: ProtoDesc?): ProtobufDecoder {
-            if (parentTag == null) return decoder
-            val bytes = decoder.nextObject()
-            return ProtobufDecoder(ByteArrayInputStream(bytes))
+            if (parentTag != null) {
+                decoder.beginObject()
+            }
+            return decoder
         }
 
         private fun KSerialClassDesc.getProtoDesc(index: Int): ProtoDesc {
@@ -429,7 +476,7 @@ class ProtoBuf(val context: SerialContext? = null) {
         private const val SIZE_DELIMITED = 2
         private const val i32 = 5
 
-        val plain = ProtoBuf()
+        val plain = ProtoBufPacked()
 
         fun <T: Any> dump(saver: KSerialSaver<T>, obj: T): ByteArray = plain.dump(saver, obj)
         inline fun <reified T : Any> dump(obj: T): ByteArray = plain.dump(obj)
@@ -451,7 +498,7 @@ class ProtoBuf(val context: SerialContext? = null) {
     inline fun <reified T : Any> dumps(obj: T): String = HexConverter.printHexBinary(dump(obj), lowerCase = true)
 
     fun <T : Any> load(loader: KSerialLoader<T>, raw: ByteArray): T {
-        val stream = ByteArrayInputStream(raw)
+        val stream = LimitedByteArrayInputStream(raw)
         val reader = ProtobufReader(ProtobufDecoder(stream))
         return reader.read(loader)
     }
@@ -459,6 +506,84 @@ class ProtoBuf(val context: SerialContext? = null) {
     inline fun <reified T : Any> load(raw: ByteArray): T = load(context.klassSerializer(T::class), raw)
     inline fun <reified T : Any> loads(hex: String): T = load(HexConverter.parseHexBinary(hex))
 
+}
+
+class LimitedByteArrayInputStream(val stream: ByteArrayInputStream) {
+    private var pos = 0
+    private val limitStack = mutableListOf(0, stream.available())
+    private val curLimitPos: Int
+        get() = limitStack.last()
+
+    constructor(buf: ByteArray) : this(ByteArrayInputStream(buf))
+
+    fun pushLimit(limit: Int) {
+        val pushLimitPos = limit + pos
+        if (pushLimitPos > curLimitPos) {
+            throw IndexOutOfBoundsException("New limit exceeds current limit: $pushLimitPos > $curLimitPos")
+        }
+        limitStack += pushLimitPos
+    }
+
+    fun popLimit() = limitStack.removeAt(limitStack.lastIndex)
+
+    fun readExactNBytes(bytes: Int): ByteArray {
+        val array = ByteArray(bytes)
+        var read = 0
+        while (read < bytes) {
+            val i = this.read(array, read, bytes - read)
+            if (i == -1) throw IOException("Unexpected EOF")
+            read += i
+        }
+        return array
+    }
+
+    fun readToByteBuffer(bytes: Int): ByteBuffer {
+        val arr = readExactNBytes(bytes)
+        val buf = ByteBuffer.allocate(bytes)
+        buf.put(arr).flip()
+        return buf
+    }
+
+    fun readAllAvailableBytes(): ByteArray = readExactNBytes(available())
+
+    fun skipAllAvailableBytes() {
+        val av = available()
+        if (av > 0) {
+            skip(av.toLong())
+        }
+    }
+
+    fun available() = curLimitPos - pos
+
+    fun read(): Int {
+        return if (pos < curLimitPos) {
+            pos++
+            stream.read()
+        } else {
+            -1
+        }
+    }
+
+    fun read(b: ByteArray): Int {
+        val len = min(b.size, available())
+        return read(b, 0, len)
+    }
+
+    fun read(b: ByteArray, offset: Int, len: Int): Int {
+        val alen = min(len, available())
+        val read = stream.read(b, offset, len)
+        pos += read
+        return read
+    }
+
+    fun skip(n: Long): Long {
+        val an = min(available().toLong(), n)
+        val skipped = stream.skip(an)
+        pos += skipped.toInt()
+        return skipped
+    }
+
+    fun close() = stream.close()
 }
 
 class ProtobufDecodingException(message: String) : SerializationException(message)
